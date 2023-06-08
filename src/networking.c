@@ -4161,16 +4161,27 @@ void *IOThreadMain(void *myid) {
 
     snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
     redis_set_thread_title(thdname);
+
+    //设置线程的CPU亲和性
     redisSetCpuAffinity(server.server_cpulist);
+
+    //设置线程可以在任意时刻被kill
+    //pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    //pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
     makeThreadKillable();
 
     while(1) {
         /* Wait for start */
+        //主线程setIOPendingCount(id, count)时，这里先空转一下。
         for (int j = 0; j < 1000000; j++) {
             if (getIOPendingCount(id) != 0) break;
         }
 
         /* Give the main thread a chance to stop this thread. */
+        /* 如果pending count 小于线程数*2，或者io_threads_num == 1，那么交给主线程自己处理，阻塞子线程。
+        *   （入口是：handleClientsWithPendingWritesUsingThreads->stopThreadedIOIfNeeded）
+        *  主线程尝试加锁，加锁成功后，子线程就阻塞在这里了。（见：stopThreadedIO）
+        */
         if (getIOPendingCount(id) == 0) {
             pthread_mutex_lock(&io_threads_mutex[id]);
             pthread_mutex_unlock(&io_threads_mutex[id]);
@@ -4183,18 +4194,22 @@ void *IOThreadMain(void *myid) {
          * before we drop the pending count to 0. */
         listIter li;
         listNode *ln;
+        //每个线程都有自己的list，遍历list执行就序操作。
         listRewind(io_threads_list[id],&li);
         while((ln = listNext(&li))) {
             client *c = listNodeValue(ln);
+            //handleClientsWithPendingWritesUsingThreads()会把就序操作设置为IO_THREADS_OP_WRITE
             if (io_threads_op == IO_THREADS_OP_WRITE) {
                 writeToClient(c,0);
+            //handleClientsWithPendingReadsUsingThreads()会把就序操作设置为IO_THREADS_OP_READ
             } else if (io_threads_op == IO_THREADS_OP_READ) {
-                readQueryFromClient(c->conn);
+                readQueryFromClient(c->conn);   //读（需开启io-threads-do-reads）
             } else {
                 serverPanic("io_threads_op value is unknown");
             }
         }
         listEmpty(io_threads_list[id]);
+        // 置0，表示这个线程已经处理完了。
         setIOPendingCount(id, 0);
     }
 }
